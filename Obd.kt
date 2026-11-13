@@ -21,19 +21,21 @@ data class ObdData(
     val volts: Float = 0f
 )
 
-// Relação RPM por km/h de cada marcha (aproximada). AJUSTE para o seu carro.
-val GEAR_RATIOS = doubleArrayOf(120.0, 70.0, 48.0, 36.0, 29.0, 24.0)
+// Relação RPM por km/h padrão de cada marcha (aproximada). Dá pra ajustar dentro do app.
+val GEAR_RATIOS = listOf(120.0, 70.0, 48.0, 36.0, 29.0, 24.0)
 
-fun estimateGear(rpm: Int, speed: Int): String {
+fun estimateGear(rpm: Int, speed: Int, ratios: List<Double>): String {
     if (speed < 5 || rpm < 600) return "N"
     val r = ln(rpm.toDouble() / speed)
-    var best = 0
+    var best = -1
     var diff = Double.MAX_VALUE
-    GEAR_RATIOS.forEachIndexed { i, g ->
-        val d = abs(r - ln(g))
-        if (d < diff) { diff = d; best = i }
+    ratios.forEachIndexed { i, g ->
+        if (g > 0) {
+            val d = abs(r - ln(g))
+            if (d < diff) { diff = d; best = i }
+        }
     }
-    return (best + 1).toString()
+    return if (best < 0) "-" else (best + 1).toString()
 }
 
 class ObdClient {
