@@ -3,11 +3,21 @@ package com.bringtech.obd
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
+import android.content.Context
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.ln
 
@@ -38,15 +48,141 @@ fun estimateGear(rpm: Int, speed: Int, ratios: List<Double>): String {
     return if (best < 0) "-" else (best + 1).toString()
 }
 
+// ---------- BLE: transforma o canal serial BLE em InputStream/OutputStream ----------
+
+class QueueInputStream : InputStream() {
+    private val q = ConcurrentLinkedQueue<Int>()
+    fun push(b: ByteArray?) {
+        if (b != null) for (x in b) q.add(x.toInt() and 0xFF)
+    }
+    override fun available(): Int = q.size
+    override fun read(): Int = q.poll() ?: -1
+}
+
+class BleOutputStream(private val link: BleLink) : OutputStream() {
+    override fun write(b: Int) { link.write(byteArrayOf(b.toByte())) }
+    override fun write(b: ByteArray, off: Int, len: Int) { link.write(b.copyOfRange(off, off + len)) }
+}
+
+@SuppressLint("MissingPermission")
+@Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+class BleLink(private val ctx: Context) {
+    val inStream = QueueInputStream()
+    private var gatt: BluetoothGatt? = null
+    private var wChar: BluetoothGattCharacteristic? = null
+    @Volatile private var error: String? = null
+    private val ready = CountDownLatch(1)
+    private val writeSem = Semaphore(0)
+    private val cccd = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+    private val cb = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                g.discoverServices()
+            } else {
+                if (error == null) error = "BLE desconectou"
+                ready.countDown()
+            }
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            var n: BluetoothGattCharacteristic? = null
+            var w: BluetoothGattCharacteristic? = null
+            for (s in g.services) {
+                val su = s.uuid.toString().lowercase()
+                if (su.startsWith("00001800") || su.startsWith("00001801")) continue
+                var sn: BluetoothGattCharacteristic? = null
+                var sw: BluetoothGattCharacteristic? = null
+                for (c in s.characteristics) {
+                    val p = c.properties
+                    if (sn == null && (p and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                                BluetoothGattCharacteristic.PROPERTY_INDICATE)) != 0) sn = c
+                    if (sw == null && (p and (BluetoothGattCharacteristic.PROPERTY_WRITE or
+                                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)) != 0) sw = c
+                }
+                if (sn != null && sw != null) { n = sn; w = sw; break }
+            }
+            if (n == null || w == null) {
+                error = "BLE: não achei o canal serial deste aparelho"
+                ready.countDown()
+                return
+            }
+            wChar = w
+            g.setCharacteristicNotification(n, true)
+            val d = n.getDescriptor(cccd)
+            if (d == null) {
+                ready.countDown()
+                return
+            }
+            d.value = if ((n.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0)
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            else BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            g.writeDescriptor(d)
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            ready.countDown()
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            inStream.push(c.value)
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            writeSem.release()
+        }
+    }
+
+    fun connect(dev: BluetoothDevice) {
+        gatt = dev.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE)
+        if (!ready.await(15, TimeUnit.SECONDS)) throw IOException("BLE: tempo esgotado")
+        error?.let { throw IOException(it) }
+    }
+
+    fun write(data: ByteArray) {
+        val g = gatt ?: throw IOException("desconectado")
+        val c = wChar ?: throw IOException("desconectado")
+        var off = 0
+        while (off < data.size) {
+            val chunk = data.copyOfRange(off, minOf(off + 20, data.size))
+            off += 20
+            c.value = chunk
+            c.writeType = if ((c.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0)
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            writeSem.drainPermits()
+            if (!g.writeCharacteristic(c)) throw IOException("falha ao enviar (BLE)")
+            writeSem.tryAcquire(1000, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    fun close() {
+        try { gatt?.disconnect() } catch (_: Exception) {}
+        try { gatt?.close() } catch (_: Exception) {}
+        gatt = null
+    }
+}
+
+// ---------- Cliente OBD (ELM327) ----------
+
 class ObdClient {
     private var socket: BluetoothSocket? = null
+    private var bleLink: BleLink? = null
     private var input: InputStream? = null
     private var output: OutputStream? = null
     private val spp: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
     @SuppressLint("MissingPermission")
-    fun connect(device: BluetoothDevice) {
+    fun connect(device: BluetoothDevice, ble: Boolean, ctx: Context) {
         BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
+        if (ble) {
+            val l = BleLink(ctx)
+            l.connect(device)
+            bleLink = l
+            input = l.inStream
+            output = BleOutputStream(l)
+            return
+        }
         var s = device.createRfcommSocketToServiceRecord(spp)
         try {
             s.connect()
@@ -72,6 +208,8 @@ class ObdClient {
     fun close() {
         try { socket?.close() } catch (_: IOException) {}
         socket = null
+        bleLink?.close()
+        bleLink = null
     }
 
     private fun send(cmd: String, timeoutMs: Long = 1500): String {
