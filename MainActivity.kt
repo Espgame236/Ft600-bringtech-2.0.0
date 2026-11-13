@@ -4,7 +4,12 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -31,35 +36,78 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 
+data class Found(val dev: BluetoothDevice, val ble: Boolean)
+
+@SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity(), SensorEventListener {
     private val client = ObdClient()
     private var job: Job? = null
+    private var scanJob: Job? = null
     private var data by mutableStateOf(ObdData())
     private var status by mutableStateOf("Toque na tela para conectar")
     private var showPicker by mutableStateOf(false)
     private var showSettings by mutableStateOf(false)
+    private var scanning by mutableStateOf(false)
     private var gx by mutableStateOf(0f)
     private var gy by mutableStateOf(0f)
     private var rpmMax by mutableStateOf(8000)
     private val ratios = mutableStateListOf<Double>()
+    private val found = mutableStateListOf<Found>()
     private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
 
     private val permLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            showPicker = true
+            if (hasPerms()) {
+                showPicker = true
+                startScan()
+            }
         }
 
-    @SuppressLint("MissingPermission")
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            if (i.action == BluetoothDevice.ACTION_FOUND) {
+                deviceFrom(i)?.let { add(it, false) }
+            }
+        }
+    }
+
+    private val bleCb = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            add(result.device, true)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun deviceFrom(i: Intent): BluetoothDevice? =
+        if (Build.VERSION.SDK_INT >= 33)
+            i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+        else i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+
+    private fun add(d: BluetoothDevice, ble: Boolean) {
+        if (found.none { it.dev.address == d.address && it.ble == ble }) found.add(Found(d, ble))
+    }
+
+    private fun neededPerms(): Array<String> =
+        if (Build.VERSION.SDK_INT >= 31)
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+        else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+
+    private fun hasPerms(): Boolean = neededPerms().all {
+        checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -74,6 +122,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         ratios.clear()
         ratios.addAll(if (saved != null && saved.size == GEAR_RATIOS.size) saved else GEAR_RATIOS)
 
+        ContextCompat.registerReceiver(
+            this, receiver, IntentFilter(BluetoothDevice.ACTION_FOUND), ContextCompat.RECEIVER_EXPORTED
+        )
+        if (!hasPerms()) permLauncher.launch(neededPerms())
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Dashboard(
@@ -81,29 +134,39 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     gx, gy, status, rpmMax, ::onTap
                 )
                 if (showPicker) {
-                    val list = bonded()
+                    val paired = bonded()
+                    val others = found.filter { f ->
+                        f.dev.name != null &&
+                            !(!f.ble && paired.any { it.address == f.dev.address })
+                    }
                     AlertDialog(
-                        onDismissRequest = { showPicker = false },
-                        confirmButton = { TextButton(onClick = { showPicker = false }) { Text("Cancelar") } },
-                        dismissButton = {
-                            TextButton(onClick = { showPicker = false; showSettings = true }) {
-                                Text("Configurações")
+                        onDismissRequest = { showPicker = false; stopScan() },
+                        confirmButton = {
+                            Row {
+                                TextButton(onClick = { startScan() }) { Text("Procurar") }
+                                TextButton(onClick = {
+                                    showPicker = false; stopScan(); showSettings = true
+                                }) { Text("Config.") }
+                                TextButton(onClick = { showPicker = false; stopScan() }) { Text("Cancelar") }
                             }
                         },
-                        title = { Text("Escolha o scanner OBD2") },
+                        title = { Text(if (scanning) "Escolha o scanner (procurando...)" else "Escolha o scanner") },
                         text = {
-                            if (list.isEmpty()) {
-                                Text("Nenhum aparelho pareado. Pareie o scanner nas configurações de Bluetooth (senha 1234 ou 0000).")
-                            } else {
-                                Column {
-                                    list.forEach { dev ->
-                                        Text(
-                                            dev.name ?: dev.address,
-                                            Modifier.fillMaxWidth()
-                                                .clickable { showPicker = false; connect(dev) }
-                                                .padding(12.dp)
-                                        )
-                                    }
+                            Column(Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState())) {
+                                if (paired.isEmpty() && others.isEmpty()) {
+                                    Text(
+                                        if (scanning) "Procurando aparelhos..."
+                                        else "Nada encontrado. Plugue o scanner, ligue a ignição e toque em Procurar."
+                                    )
+                                }
+                                paired.forEach { d ->
+                                    DeviceRow(d.name ?: d.address, "Pareado") { connect(d, false) }
+                                }
+                                others.forEach { f ->
+                                    DeviceRow(
+                                        f.dev.name ?: f.dev.address,
+                                        if (f.ble) "BLE" else "Bluetooth"
+                                    ) { connect(f.dev, f.ble) }
                                 }
                             }
                         }
@@ -138,29 +201,57 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun onTap() {
-        if (Build.VERSION.SDK_INT >= 31 &&
-            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
-        ) {
-            permLauncher.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT))
-        } else {
-            showPicker = true
+        if (!hasPerms()) {
+            permLauncher.launch(neededPerms())
+            return
         }
+        showPicker = true
+        startScan()
     }
 
-    @SuppressLint("MissingPermission")
     private fun bonded(): List<BluetoothDevice> = try {
         BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.toList() ?: emptyList()
     } catch (e: SecurityException) {
         emptyList()
     }
 
-    @SuppressLint("MissingPermission")
-    private fun connect(dev: BluetoothDevice) {
+    private fun startScan() {
+        val ad = BluetoothAdapter.getDefaultAdapter() ?: return
+        if (!ad.isEnabled) {
+            status = "Ligue o Bluetooth do celular"
+            return
+        }
+        found.clear()
+        scanning = true
+        try {
+            if (ad.isDiscovering) ad.cancelDiscovery()
+            ad.startDiscovery()
+        } catch (e: SecurityException) {}
+        try { ad.bluetoothLeScanner?.startScan(bleCb) } catch (e: Exception) {}
+        scanJob?.cancel()
+        scanJob = lifecycleScope.launch {
+            delay(12000)
+            stopScan()
+        }
+    }
+
+    private fun stopScan() {
+        scanJob?.cancel()
+        val ad = BluetoothAdapter.getDefaultAdapter()
+        try { ad?.cancelDiscovery() } catch (e: Exception) {}
+        try { ad?.bluetoothLeScanner?.stopScan(bleCb) } catch (e: Exception) {}
+        scanning = false
+    }
+
+    private fun connect(dev: BluetoothDevice, ble: Boolean) {
+        showPicker = false
+        stopScan()
         job?.cancel()
         job = lifecycleScope.launch(Dispatchers.IO) {
             try {
                 status = "Conectando..."
-                client.connect(dev)
+                val useBle = ble || dev.type == BluetoothDevice.DEVICE_TYPE_LE
+                client.connect(dev, useBle, applicationContext)
                 client.init()
                 status = "Conectado: ${dev.name ?: dev.address}"
                 var i = 0
@@ -188,6 +279,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         (getSystemService(Context.SENSOR_SERVICE) as SensorManager).unregisterListener(this)
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        stopScan()
+        try { unregisterReceiver(receiver) } catch (e: Exception) {}
+    }
+
     // Celular deitado de lado, tela virada pro motorista:
     // lateral = eixo X, frente/trás = -Z.
     override fun onSensorChanged(e: SensorEvent) {
@@ -196,6 +293,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+}
+
+@Composable
+private fun DeviceRow(title: String, tag: String, onClick: () -> Unit) {
+    Column(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp)) {
+        Text(title, fontSize = 16.sp)
+        Text(tag, fontSize = 11.sp)
+    }
 }
 
 private fun fmt(v: Double): String = String.format(Locale.US, "%.1f", v)
